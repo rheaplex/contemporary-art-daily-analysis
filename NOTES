@@ -1,0 +1,14 @@
+## For unknown reasons stemCompletion gives bad results with this corpus,
+## materi->materia for example, if we stem the dtm then try to complete the
+## terms from the lda. This seems to make up terms, or use ones that appear at
+## most once.
+## Alternatively, stemming then completing the corpus takes forever because:
+## https://stackoverflow.com/questions/16988151/max-reasonable-size-for-stemcompletion-in-tm
+## So, for the moment, don't stem.
+
+## tm 0.60+ doesn't like using simple character functions with tm_map
+## so we wrap tolower in a content_transformer to handle this.
+##texts.corpus <- tm_map(texts.corpus, content_transformer(tolower))
+##texts.corpus <- tm_map(texts.corpus, removePunctuation)
+##texts.corpus <- tm_map(texts.corpus, removeNumbers)
+##texts.corpus <- tm_map(texts.corpus, removeWords, stopwords("english"))
