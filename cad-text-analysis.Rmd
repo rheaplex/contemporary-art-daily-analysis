@@ -1,0 +1,599 @@
+```{r setup, include = FALSE}
+library(tm)
+library(topicmodels)
+library(wordcloud)
+library(stringr)
+library(igraph)
+
+library(SnowballC)
+##library(proxy)
+##library(Rgraphviz)
+
+opts_chunk$set(fig.align = 'center') ## cache = TRUE,
+```
+
+```{r preparation, include = FALSE}
+################################################################################
+# Load and generate data
+################################################################################
+
+shows <- read.csv("csv/press-release-shows.csv", encoding = "UTF-8")
+artists <- read.csv("csv/press-release-artists.csv", encoding = "UTF-8")
+images <- read.csv("csv/press-release-images.csv", encoding = "UTF-8")
+texts <- read.csv("csv/press-release-texts.csv", encoding = "UTF-8")
+
+################################################################################
+## Create corpus and matrices
+################################################################################
+
+texts.corpus <- Corpus(VectorSource(texts$press.release))
+texts.dict <- texts.corpus
+
+tf.control <- list(tolower = TRUE,
+                   removePunctuation = TRUE,
+                   removeNumbers = TRUE,
+                   stopwords = stopwords("english"),
+                   ##stemming = TRUE,
+                   wordLengths = c(3, Inf),
+                   weighting = weightTf)
+
+tfidf.control <- list(tolower = TRUE,
+                   removePunctuation = TRUE,
+                   removeNumbers = TRUE,
+                   stopwords = stopwords("english"),
+                   ##stemming = TRUE,
+                   wordLengths = c(3, Inf),
+                   weighting = weightTfIdf)
+
+texts.tdm <- TermDocumentMatrix(texts.corpus, control = tf.control)
+texts.tdm <- removeSparseTerms(texts.tdm, 0.9)
+
+texts.dtm <- DocumentTermMatrix(texts.corpus, control = tf.control)
+texts.dtm <- removeSparseTerms(texts.dtm, 0.9)
+
+################################################################################
+## Utility code
+################################################################################
+
+## Inspect without printing
+
+inspectSilently <- function(source) {
+    as.matrix(source)
+}
+
+## Summarize a single column as a table
+
+summarize <- function(column, amount, a, b) {
+    the.summary <- summary(column)[1:amount]
+    the.summary <- the.summary[names(the.summary) !=  ""]
+    most.frequent <- data.frame(names(the.summary),
+                                      the.summary,
+                                      row.names = NULL)
+    names(most.frequent) <- c(a, b)
+    most.frequent
+}
+
+## Inline htm-formatted frequencies from dtm rows (...documents)
+
+tdmFrequenciesForIndex <- function(index, tdm, min.count = 0) {
+    freqs <- inspectSilently(tdm[, index])
+    gt.min <- 1:length(freqs[freqs > min.count])
+    decreasing.order <- order(freqs, decreasing = TRUE)[gt.min]
+    names.ordered <- rownames(freqs)[decreasing.order]
+    freqs.ordered <- freqs[decreasing.order]
+    descs <- paste(names.ordered, " (", freqs.ordered, ")", sep = "",
+                   collapse = ", ")
+    paste("<b>", colnames(tdm)[index], ":</b>", descs, collapse = "")
+}
+
+## Inline a word cloud for each column/document
+
+tdmWordClouds <- function(tdm, min.freq = 25) {
+    sapply(1:length(colnames(tdm)),
+            function(x) {
+                cat("<h3>", colnames(tdm)[x], "</h3>\n")
+                wordcloud(rownames(tdm),
+                inspectSilently(tdm[,x]), min.freq = min.freq)
+            }) -> .null
+}
+
+## Dendrogram-free heatmap
+
+heatMap <- function(freq) {
+    norm.freq <- freq * (1.0 / max(freq))
+    par(mai = c(2.75,1.5,0.1,0.42))
+    image(t(norm.freq)[,dim(norm.freq)[1]:1], xaxt = 'n', yaxt = 'n',
+          bty = 'n', col = brewer.pal(9, "Blues"))
+    axis(1, at = seq(0,1,,dim(norm.freq)[2]), lty = 0,
+         labels = colnames(norm.freq), las = 2)
+    axis(2, at = seq(0,1,,dim(norm.freq)[1]), lty = 0,
+         labels = rev(rownames(norm.freq)), las = 2)
+}
+
+## Inline table of popularity by year
+
+mostPopularByYear <- function(source, column) {
+    year.counts <- table(source[c(column, "year")])
+    year.counts <- year.counts[rownames(year.counts) !=  "", ]
+    highest.counts <- year.counts[rowSums(year.counts) >=  7, ]
+    kable(highest.counts[order(rowSums(highest.counts), decreasing = TRUE), ])
+}
+
+## Group the DTM into the given number of clusters
+
+clusterMatrix <- function(dtm, dtm.names, cluster.count) {
+    clusters<-kmeans(dtm, cluster.count)
+    clusters.names<-lapply(1:cluster.count,
+        function(cluster){
+            dtm.names[clusters$cluster ==  cluster]})
+    paste(lapply(1:cluster.count,
+                 function(cluster){
+                    paste("Cluster", cluster, ":",
+                                     paste(unlist(clusters.names[cluster]),
+                                     collapse = ", "))
+                 }),
+             collapse = ".<br />\n")
+}
+
+## Plot the graph in a nice style
+
+plot.graph <- function (g, colour = "deepskyblue") {
+    ## We scale various properties by degree, so we get degree and max for this
+    degrees <- degree(g)
+    max.degree <- max(degrees)
+    ## 15 is the default - http://igraph.sourceforge.net/doc/R/plot.common.html
+    vertex.sizes <- (0.3 + (degrees * (0.7 / max.degree))) * 30
+
+    ##par(bg = "white")
+    ##par(mai = c(0.25, 0.25, 0.25, 0.25))
+    plot(g,
+         ##edge.width = 0.01,
+         ## This refuses to work as an edge property
+         ## lightgray was too pale for single lines on one graph
+         edge.color = colour,
+         edge.arrow.size = 0.0,
+         ##edge.curved = TRUE,
+         vertex.size = vertex.sizes,
+         vertex.frame.color = NA,
+         vertex.color = colour,
+         ##vertex.label.cex = vertex.sizes * 0.025,
+         vertex.label.family = "sans",
+         vertex.label.font = 2, ## bold
+         vertex.label.color = "black",
+         )
+}
+
+## Convert the relationship table to a graph suitable for plotting
+
+toGraph <- function (relationships) {
+    ## Create a graph from the table
+    g <- graph.edgelist(as.matrix(relationships), directed = FALSE)
+    ## Simplify the graph to remove self-loops
+    simplify(g, remove.multiple = FALSE, remove.loops = TRUE)
+}
+
+## Remove small unconnected graphs / islands
+
+removeIslands <- function (g) {
+    cl <- clusters(g)
+    induced.subgraph(g, cl$membership ==  1)
+}
+
+## Filter out nodes by degree
+
+filterIslands <- function (g, min.degree = 3) {
+    delete.vertices(g, which(degree(g) < min.degree))
+}
+
+## Paste selected texts
+
+pasteShowTexts <- function(index, match.field) {
+    pages <- shows$page[shows[,match.field] ==  index]
+    page.texts <- texts$press.release[texts$page %in% pages]
+    paste(page.texts, collapse = "\n")
+}
+
+## Corpus to de-sparsed tf-idf
+
+toTfIdf <- function(corpus) {
+    tfidf <- TermDocumentMatrix(corpus, control = tfidf.control)
+    removeSparseTerms(tfidf, 0.20)
+}
+
+## Return a named list of details about shows
+## selected by the frequency of a particular field
+## pr ==  press releases
+
+showDetails <- function(entries, pr, min.count = 10) {
+    pr.corpus <- Corpus(VectorSource(pr))
+
+    pr.tfidf <- toTfIdf(pr.corpus)
+
+    pr.freq <- inspectSilently(pr.tfidf)
+    colnames(pr.freq) <- entries
+
+    pr.tdm <- TermDocumentMatrix(pr.corpus, control = tf.control)
+    pr.tdm <- removeSparseTerms(pr.tdm, 0.1)
+    colnames(pr.tdm) <- entries
+
+    pr.dtm <- DocumentTermMatrix(pr.corpus, control = tf.control)
+    pr.dtm <- removeSparseTerms(pr.dtm, 0.1)
+
+    ## Format up most frequent words from the press releases
+    pr.descs <- sapply(1:length(entries),
+                               tdmFrequenciesForIndex,
+                               tdm = pr.tdm,
+                               min.count = min.count)
+
+    list(names = entries, texts = pr, tfidf = pr.tfidf,
+         tdm = pr.tdm, dtm = pr.dtm, freqs = pr.freq,
+         descs = pr.descs)
+}
+
+## Get the details for the most popular shows by field
+
+popularShowDetails <- function(field, min.count = 10) {
+    all.entries <- summary(shows[, field])
+    all.entries <- all.entries[names(all.entries) !=  ""]
+    entries <- names(all.entries)[1:20]
+    pr <- sapply(entries, function(x) {pasteShowTexts(x, field)})
+    showDetails(entries, pr, min.count)
+}
+
+## Get the details for shows by year
+
+yearShowDetails <- function(min.count = 10) {
+    all.years <- unique(shows$year)
+    all.years <- sort(all.years[! is.na(all.years)])
+    years.pr <- sapply(all.years, function(year) {pasteShowTexts(year, "year")})
+    showDetails(all.years, years.pr, min.count)
+}
+
+## Make a matrix of artist/entity associations
+## e.g. artist/location. TRUE = artist has been in a show there. FALSE = hasn't.
+## If there are two shows called (e.g.) "Untitled", this give bogus results.
+
+artistShowMatrix <- function(artists.to.use, field) {
+    ## These will be locations, shows, or venues
+    column.names <- unique(shows[,field])
+    column.names <- column.names[column.names !=  '']
+    occurrences <- matrix(FALSE,
+                          nrow = length(artists.to.use),
+                          ncol = length(column.names),
+                          dimnames = list(artists.to.use, column.names))
+    ## Nested for loop in R. Not sure how to vectorize
+    for (artist in as.character(artists.to.use)) {
+        artist.pages <- artists[artists$artist ==  artist, ]$page
+        for (column in column.names) {
+            ## Get the page numbers for the shows ,
+            pages <- shows[shows[,field] ==  column, ]$page
+            ## See if the artist is in a show with that page number
+            occurrences[artist, column] <- any(! is.na(match(pages,
+                                                             artist.pages)))
+        }
+    }
+    occurrences
+}
+
+```
+
+
+Contemporary Art Daily
+======================
+
+```{r press_releases_word_cloud, echo = FALSE}
+texts.matrix<-as.matrix(texts.tdm)
+texts.matrix.sorted<-sort(rowSums(texts.matrix), decreasing = TRUE)
+texts.names<-names(texts.matrix.sorted)
+texts.word.freqs<-data.frame(word = texts.names, freq = texts.matrix.sorted)
+
+wordcloud(texts.word.freqs$word, texts.word.freqs$freq, min.freq = 250)
+```
+
+Contemporary Art Daily (CAD) is a leading contemporary art blog that publishes documentation for selected shows of contemporary art. It was started in 2008 by then art student Forrest Nash, who describes the site as follows:
+
+> Contemporary Art Daily is a website that publishes documentation of at least one contemporary art exhibition every day. We have an international purview, and we work hard to get especially high-quality documentation of the shows we publish.
+
+Since `r min(shows$year, na.rm = TRUE)` CAD has published the details of more than `r floor(length(shows$page) / 100) * 100` shows including descriptive text, images of works included, and lists of artists involved in each show.
+
+Nash describes the criteria used for selecting that documentation as follows:
+
+> Our criteria for Contemporary Art Daily is complicated and not perfectly reducible, but I like to say that we are generally trying to balance two motives that sometimes conflict with each other. On the one hand, we do have a kind of journalistic motive: we hope to in some way represent the breadth of what is happening in contemporary art, even when a particular artist is not of personal interest to us. On the other hand, we have a curatorial motive, to advance art we believe in and think is important. I am usually more concerned about making a mistake and failing to see or include something than I am accidentally letting something through the filter that doesn’t belong.
+
+(from: http://metropolism.com/features/why-contemporary-art-daily/).
+
+As a curated resource, CAD is not a statistically representative population sample of all available contemporary art shows. Like a museum collection, a survey show or a textbook it is a mediated, value-laden view of the artworld. Its popularity demonstrates the appeal of this particular view to contemporary artworld audiences. Analyzing CAD is therefore a way of gaining an insight into one popular view of the contemporary artworld.
+
+The html code of www.contemporaryartdaily.com was downloaded in January 2014 and processed with an R script to extract text and information from each post on the site announcing a show that fits their standard format. This data was then loaded by the R code in this file to generate the report you are now reading. For reasons of practicality and clarity Some analysis has been performed on the entire dataset, some on just the most popular entities (...most frequently occurring values) within it.
+
+The presence or absence of surprises in the data may indicate fidelity or bias in the worldview of either Contemporary Art Daily or of the online contemporary artworld audience in relation to each other. The extent to which this generalizes to the culture or the reality of the wider contemporary artworld is open to question. Comparing CAD to the data of a more general art show resource website would provide evidence for this but is outside the scope of the current study. The reader's intuition will have to suffice on these matters for now.
+
+
+Texts
+=====
+
+Word Frequency
+--------------
+*Words that occur 500 or more times in the corpus:* `r findFreqTerms(texts.tdm, lowfreq = 500)`.
+
+*Words that occur 1000 or more times in the corpus:* `r findFreqTerms(texts.tdm, lowfreq = 1000)`.
+
+*Words that occur 2000 or more times in the corpus:* `r findFreqTerms(texts.tdm, lowfreq = 2000)`.
+
+Word Associations For Most Frequent Terms
+-----------------------------------------
+```{r press_releases_frequent_terms_associations, echo = FALSE, results = "asis"}
+describeAssocs <- function(assocList, term) {
+    assocs <- paste(names(assocList[[term]]), collapse = ", ")
+    ## <b> to make the term bold in html, * for markdown isn't parsed under asis
+    paste(c("<b>", term, ":", "</b> ", assocs), collapse = "")
+}
+
+assocs <- findAssocs(texts.dtm, findFreqTerms(texts.tdm, lowfreq = 2000), 0.25)
+descs <- sapply(names(assocs),
+                function(name) { describeAssocs(assocs, name) })
+
+cat(descs, sep = "\n\n")
+```
+
+```{r press_releases_clustering, include = FALSE, cache = TRUE}
+## Text Clustering
+## Not currently working
+## 150 was the number found automatically
+## clusterCount<-10
+## clusters<-kmeans(texts.dtm, clusterCount)
+## clusters.texts<-lapply(1:clusterCount,
+##                           function(cluster){
+##                               texts$artist[clusters$cluster ==  cluster]})
+## ##clusters.texts
+## for(cluster in 1:clusterCount){
+##     cat("Cluster", cluster, ":",
+##         paste(unlist(clusters.texts[cluster]), collapse = ", "), "\n\n")
+## }
+```
+
+
+Text Topic Modelling
+--------------------
+```{r press_release_topic_modelling, echo = FALSE, results = "asis", cache = TRUE}
+lda.control <- list(burnin = 1000,
+                    iter = 1000,
+                    keep = 50)
+k <- 30
+lda <- LDA(texts.dtm, k, method = "Gibbs", control = lda.control)
+topic.terms <- terms(lda, 20)
+
+topic.descs <- apply(topic.terms, 2, paste, collapse = ", ")
+for(i in 1:length(topic.descs)) {
+    cat("<b>Topic ", i, ":</b> ", topic.descs[i], ".\n\n", sep = "")
+}
+```
+
+Text Vocabulary Over Time
+=========================
+
+```{r press_releases_over_time, echo = FALSE}
+years.details <- yearShowDetails(50)
+```
+
+Year Vocabulary Word Frequencies
+--------------------------------
+`r paste(years.details$descs, collapse = ".\n\n")`
+
+Year Vocabulary tf-idf Heatmap
+------------------------------
+```{r year_matrix_tfidf, echo = FALSE, results = "asis", fig.height = 24}
+yearsfreq <- years.details$freq[rowSums(years.details$freq) > 0.00015, ]
+heatMap(yearsfreq)
+```
+
+Year Vocabulary Wordclouds
+--------------------------
+```{r year_wordclouds, echo = FALSE, results = "asis"}
+tdmWordClouds(years.details$tdm, 100)
+```
+
+
+Artists
+=======
+
+Artist Popularity
+-----------------
+```{r most_popular_artists, echo = FALSE, results = "asis"}
+most.popular.artists <- summarize(artists$artist, 48, "Artist", "Shows")
+kable(most.popular.artists)
+```
+
+Artist Popularity By Year
+-------------------------
+```{r most_popular_artists_years, echo = FALSE, results = "asis"}
+mostPopularByYear(artists, "artist")
+```
+
+Artist Clustering
+-----------------
+```{r artist_cluster_shows, echo = FALSE, results = "asis", cache = TRUE}
+artist.shows <- artistShowMatrix(most.popular.artists$Artist, 'title')
+artist.venues <- artistShowMatrix(most.popular.artists$Artist, 'venue')
+artist.venues <- artistShowMatrix(most.popular.artists$Artist, 'venue')
+```
+We can't cluster artists by texts as the text may not refer to them uiquely.
+
+So we cluster artists by show, venue, and city appearances.
+
+**Show:**
+
+`r clusterMatrix(artist.shows, most.popular.artists$Artist, 8)`
+
+**Venue:**
+
+`r clusterMatrix(artist.venues, most.popular.artists$Artist, 8)`
+
+**City:**
+
+`r clusterMatrix(artist.venues, most.popular.artists$Artist, 8)`
+
+
+Venues
+======
+```{r venue_matrices, echo = FALSE}
+popular.venues <- popularShowDetails("venue")
+```
+
+Most Popular Venues
+-------------------
+```{r most_popular_venues, echo = FALSE, results = "asis"}
+kable(summarize(shows$venue, 35, "Venue", "Shows"))
+```
+
+Most Popular Venues By Year
+---------------------------
+```{r most_popular_venue_years, echo = FALSE, results = "asis"}
+mostPopularByYear(shows, "venue")
+```
+
+Venue Word Frequencies
+----------------------
+`r paste(popular.venues$descs, collapse = ".\n\n")`
+
+Venue Clustering
+----------------
+
+Clustering the most popular venues:
+
+`r clusterMatrix(popular.venues$dtm, popular.venues$names, 5)`
+
+
+Venue Wordclouds
+----------------
+```{r venue_wordclouds, echo = FALSE, results = "asis"}
+tdmWordClouds(popular.venues$tdm, 20)
+```
+
+Venue tf-idf Heatmap
+--------------------
+```{r venue_matrix_tfidf, echo = FALSE, results = "asis", fig.height = 24}
+venuesfreq <- popular.venues$freq[rowSums(popular.venues$freq) > 0.002, ]
+heatMap(venuesfreq)
+```
+
+Cities
+======
+
+```{r location_matrices, echo = FALSE}
+popular.locations <- popularShowDetails("location")
+```
+
+Most Popular Cities
+-------------------
+Naive city determination, we should clean this up somehow.
+```{r most_popular_venue_locations, echo = FALSE, results = "asis"}
+kable(summarize(shows$location, 35, "Location", "Shows"))
+```
+
+Most Popular Cities By Year
+---------------------------
+```{r most_popular_city_years, echo = FALSE, results = "asis"}
+mostPopularByYear(shows, "location")
+```
+
+City Word Frequencies
+---------------------
+`r paste(popular.locations$descs, collapse = ".\n\n")`
+
+City Clustering
+---------------
+Clustering the most popular cities:
+
+`r paste(clusterMatrix(popular.locations$dtm, popular.locations$names, 5))`
+
+City tf-idf Heatmap
+-------------------
+```{r location_matrix_tfidf, echo = FALSE, results = "asis", fig.height = 14}
+locfreqs <- popular.locations$freqs[rowSums(popular.locations$freqs) > 0.002, ]
+heatMap(locfreqs)
+```
+
+City Wordclouds
+---------------
+```{r city_wordclouds, echo = FALSE, results = "asis"}
+tdmWordClouds(popular.locations$tdm, 20)
+```
+
+
+Graphs of show/gallery/artist links
+===================================
+
+```{r show_links_graphs, echo = FALSE}
+popular.venues.shows <- shows[shows$venue %in% popular.venues$names, ]
+popular.venues.shows.artists <- artists[artists$page %in% popular.venues.shows$page, ]
+popular.venues.shows.locations <- shows$location[match(popular.venues.shows.artists$page, shows$page)]
+
+popular.venues.shows.locations.artists <- data.frame(artist = popular.venues.shows.artists$artist,
+                                                     location = popular.venues.shows.locations)
+
+popular.venues.shows.artists.unique <- unique(popular.venues.shows.artists$artist)
+
+## Generate a matrix of pairs of locations (cities)
+## representing each pair of cities an artist has exhibited in.
+## This is the reflexive cartesian product of the list of cities
+## for the artist.
+## This will therefore include city1:city1, probably many times
+## and will give city1:city2 many times if the artist has only shown
+## in city2 once.
+## Replace with a simple pair walk *or* weight better.
+
+popular.locations.artists.links <- do.call(rbind,
+                lapply(popular.venues.shows.artists.unique,
+                function(artist) {
+                   locations <- popular.venues.shows.locations.artists$location[popular.venues.shows.locations.artists$artist  ==  artist]
+                   expand.grid(locations, locations)
+
+                }))
+
+## Generate a matrix of pairs of shows each artist has exhibited in
+
+popular.shows.artists.links <- do.call(rbind,
+                lapply(popular.venues.shows.artists.unique,
+                function(artist) {
+                   pages <- popular.venues.shows.artists$page[popular.venues.shows.artists$artist == artist]
+                   shows <- popular.venues.shows$title[popular.venues.shows$page %in% pages]
+                   ## Some shows have no title (or none was extracted)
+                   ## remove as otherwise this breaks the graph
+                   ## Also convert to Windoze encoding to avoid knitr breakage
+                   shows <- iconv(shows[shows != ''], 'utf-8', '')
+                   expand.grid(shows, shows)
+                }))
+
+## Generate a matrix of pairs of venues each artist has exhibited in
+
+popular.venues.artists.links <- do.call(rbind,
+                lapply(popular.venues.shows.artists.unique,
+                function(artist) {
+                   pages <- popular.venues.shows.artists$page[popular.venues.shows.artists$artist == artist]
+                   venues <- popular.venues.shows$venue[popular.venues.shows$page %in% pages]
+                   expand.grid(venues, venues)
+                }))
+
+popular.locations.graph <- toGraph(popular.locations.artists.links)
+popular.venues.graph <- toGraph(popular.venues.artists.links)
+popular.shows.graph <- toGraph(popular.shows.artists.links)
+```
+
+Locations
+---------
+```{r locations_graph, echo = FALSE}
+plot.graph(removeIslands(popular.locations.graph), colour = "plum")
+```
+
+Venues
+------
+```{r venues_graph, echo = FALSE, fig.width = 10, fig.height = 10}
+plot.graph(removeIslands(popular.venues.graph), colour = "darkgoldenrod1")
+```
+
+Shows
+-----
+```{r shows_graph, echo = FALSE, fig.width = 12, fig.height = 12}
+plot.graph(filterIslands(popular.shows.graph, 10), colour = "darkturquoise")
+```
